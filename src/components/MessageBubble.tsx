@@ -1,9 +1,9 @@
 import { memo, useRef, useEffect } from 'react'
-import type { ChatMessage } from '../types'
+import type { VirtualBlock } from '../types'
 import { useStreamInterceptor } from '../hooks/useStreamInterceptor'
 
 interface MessageBubbleProps {
-  message: ChatMessage
+  block: VirtualBlock
   /** 虚拟列表中的索引，用于 data-index 属性 */
   index: number
   /** 注册 ResizeObserver 观察 */
@@ -13,16 +13,15 @@ interface MessageBubbleProps {
 }
 
 /**
- * 单条消息气泡组件
+ * 单个块的渲染组件
  *
- * 使用 React.memo 包裹，切断父组件更新时对历史（非流式）消息的不必要重绘。
- * memo 的比较逻辑：只在 message.content 或 message.streaming 变化时才重新渲染。
+ * 一条消息可能由多个块组成，通过 isFirstBlock / isLastBlock
+ * 控制角色标签、圆角、光标等视觉元素的显示。
  */
 const MessageBubble = memo<MessageBubbleProps>(
-  ({ message, index, onObserve, onUnobserve }) => {
+  ({ block, index, onObserve, onUnobserve }) => {
     const elRef = useRef<HTMLDivElement>(null)
 
-    // 挂载时注册观察，卸载时取消观察
     useEffect(() => {
       const el = elRef.current
       onObserve(el)
@@ -31,31 +30,43 @@ const MessageBubble = memo<MessageBubbleProps>(
       }
     }, [onObserve, onUnobserve])
 
-    // 使用流式拦截器将 markdown 转为安全的 HTML
-    const html = useStreamInterceptor(message.content, !!message.streaming)
+    const html = useStreamInterceptor(block.content, block.streaming)
 
-    const isUser = message.role === 'user'
+    const isUser = block.role === 'user'
+
+    // 根据块在消息中的位置决定 CSS 类
+    const positionClass =
+      block.isFirstBlock && block.isLastBlock
+        ? 'block-only'
+        : block.isFirstBlock
+          ? 'block-first'
+          : block.isLastBlock
+            ? 'block-last'
+            : 'block-middle'
 
     return (
       <div
         ref={elRef}
         data-index={index}
-        className={`message-bubble ${isUser ? 'message-user' : 'message-assistant'}`}
+        className={`message-bubble ${isUser ? 'message-user' : 'message-assistant'} ${positionClass}`}
       >
-        <div className="message-role">{isUser ? '你' : 'AI'}</div>
+        {block.isFirstBlock && (
+          <div className="message-role">{isUser ? '你' : 'AI'}</div>
+        )}
         <div
           className="message-content"
           dangerouslySetInnerHTML={{ __html: html }}
         />
-        {message.streaming && <span className="streaming-cursor" />}
+        {block.streaming && block.isLastBlock && <span className="streaming-cursor" />}
       </div>
     )
   },
   (prevProps, nextProps) => {
-    // 自定义比较：只在内容或流式状态变化时才重绘
     return (
-      prevProps.message.content === nextProps.message.content &&
-      prevProps.message.streaming === nextProps.message.streaming &&
+      prevProps.block.content === nextProps.block.content &&
+      prevProps.block.streaming === nextProps.block.streaming &&
+      prevProps.block.isFirstBlock === nextProps.block.isFirstBlock &&
+      prevProps.block.isLastBlock === nextProps.block.isLastBlock &&
       prevProps.index === nextProps.index
     )
   }

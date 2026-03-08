@@ -6,6 +6,11 @@ const DEFAULT_ITEM_HEIGHT = 80
 /** 视口上下各额外渲染的缓冲条目数 */
 const BUFFER_COUNT = 3
 
+interface VisibleRange {
+  startIndex: number
+  endIndex: number
+}
+
 /**
  * useDynamicVirtualList Hook
  *
@@ -14,47 +19,87 @@ const BUFFER_COUNT = 3
  * 2. 根据滚动位置计算当前可见区域（startIndex ~ endIndex）
  * 3. 通过 ResizeObserver 监听真实 DOM 的高度变化
  * 4. 通过 requestIdleCallback 异步批量处理高度变更，避免阻塞主线程
- * 5. 自动锚定底部（流式输出时），用户手动上滚则暂停锚定
  *
  * @param totalCount - 总条目数
  * @param containerHeight - 滚动容器的可视高度（px）
  */
 export function useDynamicVirtualList(totalCount: number, containerHeight: number) {
-  // ===== positions 数组：记录每个条目的位置信息 =====
-  // 使用 useRef 而非 useState，避免每次更新都触发重渲染
   const positionsRef = useRef<ItemPosition[]>([])
-
-  // ===== 高度变更队列（Queue）=====
-  // ResizeObserver 回调中只入队，不直接计算
   const heightDiffQueueRef = useRef<HeightDiff[]>([])
-
-  // ===== rIC（requestIdleCallback）句柄，用于取消 =====
   const ricHandleRef = useRef<number | null>(null)
-
-  // ===== 滚动容器 ref =====
   const scrollContainerRef = useRef<HTMLDivElement>(null)
-
-  // ===== 是否锚定底部 =====
-  const isAnchoredToBottomRef = useRef(true)
-
-  // ===== 触发 React 视图更新的版本号 =====
-  // 当 rIC 完成计算后递增此值，驱动 React 重新渲染
-  const [layoutVersion, setLayoutVersion] = useState(0)
-
-  // ===== 滚动偏移量 =====
-  const [scrollTop, setScrollTop] = useState(0)
-
-  // ===== ResizeObserver 实例 =====
   const resizeObserverRef = useRef<ResizeObserver | null>(null)
 
+  // scrollTop 用 ref 存储，避免每像素触发重渲染
+  const scrollTopRef = useRef(0)
+
+  // rAF 句柄，用于节流滚动事件
+  const rafHandleRef = useRef<number | null>(null)
+
+  // 当前可见范围的 ref（用于在滚动回调中比较）
+  const visibleRangeRef = useRef<VisibleRange>({ startIndex: 0, endIndex: 0 })
+
+  // 驱动 React 重渲染的版本号
+  const [layoutVersion, setLayoutVersion] = useState(0)
+
+  // 可见范围 state：只在范围变化时才更新，驱动 React 重渲染
+  const [visibleRange, setVisibleRange] = useState<VisibleRange>({ startIndex: 0, endIndex: 0 })
+
+  // ===== 二分查找 =====
+  const findStartIndex = useCallback((offset: number): number => {
+    const positions = positionsRef.current
+    if (positions.length === 0) return 0
+    let low = 0
+    let high = positions.length - 1
+
+    while (low <= high) {
+      const mid = Math.floor((low + high) / 2)
+      if (positions[mid].bottom <= offset) {
+        low = mid + 1
+      } else if (positions[mid].top > offset) {
+        high = mid - 1
+      } else {
+        return mid
+      }
+    }
+    return Math.min(low, positions.length - 1)
+  }, [])
+
+  // ===== 计算可见范围（纯函数，不触发渲染）=====
+  const computeVisibleRange = useCallback((scrollTop: number): VisibleRange => {
+    if (totalCount === 0) return { startIndex: 0, endIndex: 0 }
+
+    const positions = positionsRef.current
+    if (positions.length === 0) return { startIndex: 0, endIndex: 0 }
+
+    const rawStart = findStartIndex(scrollTop)
+    const startIndex = Math.max(0, rawStart - BUFFER_COUNT)
+
+    const viewBottom = scrollTop + containerHeight
+    let endIndex = rawStart
+    while (endIndex < positions.length - 1 && positions[endIndex].top < viewBottom) {
+      endIndex++
+    }
+    endIndex = Math.min(positions.length - 1, endIndex + BUFFER_COUNT)
+
+    return { startIndex, endIndex }
+  }, [totalCount, containerHeight, findStartIndex])
+
+  // ===== 比较并更新可见范围，只在变化时触发渲染 =====
+  const updateVisibleRangeIfChanged = useCallback((newRange: VisibleRange) => {
+    const prev = visibleRangeRef.current
+    if (prev.startIndex !== newRange.startIndex || prev.endIndex !== newRange.endIndex) {
+      visibleRangeRef.current = newRange
+      setVisibleRange(newRange)
+    }
+  }, [])
+
   // ===== 初始化 / 扩展 positions 数组 =====
-  // 当 totalCount 增大时，追加新条目的估算位置
   useEffect(() => {
     const positions = positionsRef.current
     const oldLength = positions.length
 
     if (totalCount > oldLength) {
-      // 计算上一个条目的 bottom 作为新条目的起始 top
       const lastBottom = oldLength > 0 ? positions[oldLength - 1].bottom : 0
 
       for (let i = oldLength; i < totalCount; i++) {
@@ -67,62 +112,22 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
         })
       }
     } else if (totalCount < oldLength) {
-      // 条目减少时截断
       positions.length = totalCount
     }
-  }, [totalCount])
+
+    // totalCount 变化后重新计算可见范围
+    updateVisibleRangeIfChanged(computeVisibleRange(scrollTopRef.current))
+  }, [totalCount, computeVisibleRange, updateVisibleRangeIfChanged])
 
   // ===== 计算总列表高度 =====
   const totalHeight = useMemo(() => {
     const positions = positionsRef.current
     if (positions.length === 0) return 0
     return positions[positions.length - 1].bottom
-    // layoutVersion 变化时重新计算
-  }, [layoutVersion, totalCount])
-
-  // ===== 二分查找：根据 scrollTop 找到第一个 bottom > scrollTop 的条目 =====
-  const findStartIndex = useCallback((offset: number): number => {
-    const positions = positionsRef.current
-    let low = 0
-    let high = positions.length - 1
-
-    while (low <= high) {
-      const mid = Math.floor((low + high) / 2)
-      if (positions[mid].bottom <= offset) {
-        low = mid + 1
-      } else if (positions[mid].top > offset) {
-        high = mid - 1
-      } else {
-        // positions[mid].top <= offset < positions[mid].bottom
-        return mid
-      }
-    }
-    return Math.min(low, positions.length - 1)
-  }, [])
-
-  // ===== 计算可见区域的 startIndex 和 endIndex =====
-  const visibleRange = useMemo(() => {
-    if (totalCount === 0) return { startIndex: 0, endIndex: 0 }
-
-    const rawStart = findStartIndex(scrollTop)
-    const startIndex = Math.max(0, rawStart - BUFFER_COUNT)
-
-    // 从 rawStart 开始，找到 top > scrollTop + containerHeight 的条目
-    const positions = positionsRef.current
-    const viewBottom = scrollTop + containerHeight
-    let endIndex = rawStart
-    while (endIndex < positions.length - 1 && positions[endIndex].top < viewBottom) {
-      endIndex++
-    }
-    endIndex = Math.min(positions.length - 1, endIndex + BUFFER_COUNT)
-
-    return { startIndex, endIndex }
-    // layoutVersion 变化时需重新计算
-  }, [scrollTop, containerHeight, totalCount, findStartIndex, layoutVersion])
+  }, [layoutVersion, totalCount]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ===== 调度 rIC 异步处理高度变更队列 =====
   const scheduleLayoutUpdate = useCallback(() => {
-    // 如果已有排队中的 rIC，不重复排队
     if (ricHandleRef.current !== null) return
 
     const callback = (deadline: IdleDeadline) => {
@@ -131,19 +136,16 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
 
       if (queue.length === 0) return
 
-      // 取出所有排队的 diff，按 index 排序（从小到大），方便顺序更新偏移量
       const diffs = queue.splice(0, queue.length)
       diffs.sort((a, b) => a.index - b.index)
 
       const positions = positionsRef.current
 
-      // 用 Set 去重：同一个 index 只取最后一次的 newHeight
       const diffMap = new Map<number, number>()
       for (const d of diffs) {
         diffMap.set(d.index, d.newHeight)
       }
 
-      // 找到最小受影响的 index，从它开始向后级联更新所有偏移量
       let minIndex = Infinity
       for (const [index, newHeight] of diffMap) {
         if (index < positions.length && positions[index].height !== newHeight) {
@@ -152,21 +154,22 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
         }
       }
 
-      if (minIndex === Infinity) return // 没有实际变更
+      if (minIndex === Infinity) return
 
-      // 从 minIndex 开始，重新计算 top 和 bottom
-      // 利用 deadline.timeRemaining() 做时间分片，避免超长列表阻塞
+      // ===== 滚动补偿：记录视口锚点的旧位置 =====
+      const currentScrollTop = scrollTopRef.current
+      // 找到当前视口顶部对应的条目，作为锚点
+      const anchorIndex = findStartIndex(currentScrollTop)
+      const oldAnchorTop = anchorIndex < positions.length ? positions[anchorIndex].top : 0
+
+      // 从 minIndex 开始级联更新
       let i = minIndex
       while (i < positions.length) {
         if (deadline.timeRemaining() <= 0) {
-          // 时间片用完，重新调度继续处理剩余部分
-          // 把剩余的重新入队
-          for (let j = i; j < positions.length; j++) {
-            heightDiffQueueRef.current.push({
-              index: j,
-              newHeight: positions[j].height,
-            })
-          }
+          heightDiffQueueRef.current.push({
+            index: i,
+            newHeight: positions[i].height,
+          })
           scheduleLayoutUpdate()
           break
         }
@@ -176,26 +179,35 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
         i++
       }
 
-      // 统一触发 React 视图更新
+      // ===== 滚动补偿：如果锚点上方的高度变化了，调整 scrollTop =====
+      const container = scrollContainerRef.current
+      if (container && anchorIndex < positions.length && minIndex <= anchorIndex) {
+        const newAnchorTop = positions[anchorIndex].top
+        const delta = newAnchorTop - oldAnchorTop
+        if (Math.abs(delta) > 0.5) {
+          container.scrollTop = currentScrollTop + delta
+          scrollTopRef.current = container.scrollTop
+        }
+      }
+
+      // 布局更新后重新计算可见范围
+      updateVisibleRangeIfChanged(computeVisibleRange(scrollTopRef.current))
       setLayoutVersion((v) => v + 1)
     }
 
-    // 调用 requestIdleCallback，设置超时兜底（100ms 内必须执行）
     if (typeof requestIdleCallback !== 'undefined') {
       ricHandleRef.current = requestIdleCallback(callback, { timeout: 100 })
     } else {
-      // 降级：不支持 rIC 时用 setTimeout
       ricHandleRef.current = window.setTimeout(() => {
         callback({ timeRemaining: () => 50, didTimeout: false } as IdleDeadline)
       }, 16) as unknown as number
     }
-  }, [])
+  }, [computeVisibleRange, updateVisibleRangeIfChanged])
 
   // ===== 创建 ResizeObserver =====
   useEffect(() => {
     resizeObserverRef.current = new ResizeObserver((entries) => {
       for (const entry of entries) {
-        // 从 DOM 节点上读取 data-index 属性
         const target = entry.target as HTMLElement
         const indexStr = target.dataset.index
         if (indexStr == null) continue
@@ -203,7 +215,6 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
         const index = parseInt(indexStr, 10)
         const newHeight = entry.contentRect.height
 
-        // 只有高度真正变化才入队
         const positions = positionsRef.current
         if (index < positions.length && Math.abs(positions[index].height - newHeight) > 0.5) {
           heightDiffQueueRef.current.push({ index, newHeight })
@@ -237,17 +248,29 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
     }
   }, [])
 
-  // ===== 滚动事件处理 =====
+  // ===== 滚动事件处理（rAF 节流 + 按需渲染）=====
   const handleScroll = useCallback(() => {
-    const container = scrollContainerRef.current
-    if (!container) return
+    // 如果已有 rAF 排队，跳过，避免一帧内多次计算
+    if (rafHandleRef.current !== null) return
 
-    const newScrollTop = container.scrollTop
-    setScrollTop(newScrollTop)
+    rafHandleRef.current = requestAnimationFrame(() => {
+      rafHandleRef.current = null
+      const container = scrollContainerRef.current
+      if (!container) return
 
-    // 判断是否接近底部（距底部 50px 以内认为是锚定状态）
-    const distanceToBottom = container.scrollHeight - container.clientHeight - newScrollTop
-    isAnchoredToBottomRef.current = distanceToBottom < 50
+      scrollTopRef.current = container.scrollTop
+      // 只在可见范围变化时触发 React 重渲染
+      updateVisibleRangeIfChanged(computeVisibleRange(container.scrollTop))
+    })
+  }, [computeVisibleRange, updateVisibleRangeIfChanged])
+
+  // 清理 rAF
+  useEffect(() => {
+    return () => {
+      if (rafHandleRef.current !== null) {
+        cancelAnimationFrame(rafHandleRef.current)
+      }
+    }
   }, [])
 
   // ===== 自动滚动到底部 =====
@@ -256,16 +279,6 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
     if (!container) return
     container.scrollTop = container.scrollHeight
   }, [])
-
-  // ===== 当 totalHeight 变化时，如果锚定底部则自动滚动 =====
-  useEffect(() => {
-    if (isAnchoredToBottomRef.current) {
-      // 使用 rAF 确保 DOM 已更新后再滚动
-      requestAnimationFrame(() => {
-        scrollToBottom()
-      })
-    }
-  }, [totalHeight, totalCount, scrollToBottom])
 
   // ===== 获取条目的偏移样式 =====
   const getItemStyle = useCallback((index: number): React.CSSProperties => {
@@ -287,23 +300,13 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
   }, [layoutVersion]) // eslint-disable-line react-hooks/exhaustive-deps
 
   return {
-    /** 滚动容器 ref */
     scrollContainerRef,
-    /** 列表总高度（用于撑开滚动区域） */
     totalHeight,
-    /** 当前可见区域的起止索引 */
     visibleRange,
-    /** 获取指定条目的绝对定位样式 */
     getItemStyle,
-    /** 注册 ResizeObserver 观察某个 DOM 元素 */
     observeElement,
-    /** 取消 ResizeObserver 观察 */
     unobserveElement,
-    /** 滚动事件回调，绑定到容器的 onScroll */
     handleScroll,
-    /** 手动滚动到底部 */
     scrollToBottom,
-    /** 是否锚定在底部 */
-    isAnchoredToBottom: isAnchoredToBottomRef,
   }
 }

@@ -113,23 +113,72 @@ body {
 
 /* ===== 消息气泡 ===== */
 .message-bubble {
-  padding: 12px 16px;
-  margin: 8px 0;
-  border-radius: 12px;
+  padding: 4px 16px;
   max-width: 85%;
   line-height: 1.6;
   position: relative;
+  border-radius: 0;
+}
+
+/* 单块消息（只有一个块） */
+.message-bubble.block-only {
+  padding: 12px 16px;
+  margin: 8px 0;
+  border-radius: 12px;
+}
+
+/* 消息的第一个块 */
+.message-bubble.block-first {
+  padding-top: 12px;
+  margin-top: 8px;
+  border-top-left-radius: 12px;
+  border-top-right-radius: 12px;
+}
+
+/* 消息的最后一个块 */
+.message-bubble.block-last {
+  padding-bottom: 12px;
+  margin-bottom: 8px;
+  border-bottom-left-radius: 12px;
+  border-bottom-right-radius: 12px;
+}
+
+/* 中间块无额外间距 */
+.message-bubble.block-middle {
+  margin-top: 0;
+  margin-bottom: 0;
 }
 
 .message-user {
   background: #1a3a5c;
   margin-left: auto;
+}
+
+.message-user.block-only {
+  border-bottom-right-radius: 4px;
+}
+
+.message-user.block-last {
   border-bottom-right-radius: 4px;
 }
 
 .message-assistant {
   background: #1e1e1e;
+  border-left: 1px solid #2a2a2a;
+  border-right: 1px solid #2a2a2a;
+}
+
+.message-assistant.block-only {
   border: 1px solid #2a2a2a;
+  border-bottom-left-radius: 4px;
+}
+
+.message-assistant.block-first {
+  border-top: 1px solid #2a2a2a;
+}
+
+.message-assistant.block-last {
+  border-bottom: 1px solid #2a2a2a;
   border-bottom-left-radius: 4px;
 }
 

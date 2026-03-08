@@ -26,3 +26,26 @@ export interface HeightDiff {
   index: number
   newHeight: number
 }
+
+/**
+ * 虚拟化的最小渲染单元：一个 Markdown 块
+ *
+ * 一条消息可能被拆分为多个 VirtualBlock，
+ * 通过 isFirstBlock / isLastBlock 控制视觉分组。
+ */
+export interface VirtualBlock {
+  /** 唯一标识：`${messageId}-b${blockIndex}` */
+  id: string
+  /** 所属消息 ID */
+  messageId: string
+  /** 该块的 Markdown 原文 */
+  content: string
+  /** 消息角色 */
+  role: Role
+  /** 是否是该消息的第一个块（显示角色标签 + 顶部圆角） */
+  isFirstBlock: boolean
+  /** 是否是该消息的最后一个块（底部圆角 + 流式光标） */
+  isLastBlock: boolean
+  /** 是否正在流式输出（仅最后一个块为 true） */
+  streaming: boolean
+}
