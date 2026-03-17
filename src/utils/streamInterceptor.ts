@@ -15,12 +15,40 @@
  */
 
 /** 栈中的标记类型 */
-type MarkType = 'codeBlock' | 'inlineCode' | 'bold' | 'italic' | 'blockquote'
+type MarkType = 'codeBlock' | 'inlineCode' | 'bold' | 'italic' | 'blockquote' | 'heading' | 'table'
 
 interface StackEntry {
   type: MarkType
   /** 用于闭合的字符串 */
   closeTag: string
+}
+
+/**
+ * 判断是否为 Markdown 表格分隔行（|---|---|）
+ */
+function isTableSeparatorLine(line: string): boolean {
+  const t = line.trim()
+  if (!t.startsWith('|') || !t.endsWith('|')) return false
+  return /^\|[\s\-:|]+\|$/.test(t)
+}
+
+/**
+ * 判断是否为表格行（至少包含两个 |）
+ */
+function isTableRowLine(line: string): boolean {
+  const t = line.trim()
+  if (!t.startsWith('|')) return false
+  const pipeCount = (t.match(/\|/g) ?? []).length
+  return pipeCount >= 2
+}
+
+/**
+ * 根据表头行生成分隔行（如 | A | B | -> |---|---|）
+ */
+function makeTableSeparatorRow(headerRow: string): string {
+  const pipeCount = (headerRow.trim().match(/\|/g) ?? []).length
+  const columns = Math.max(1, pipeCount - 1)
+  return '\n|' + '---|'.repeat(columns)
 }
 
 /**
@@ -31,7 +59,9 @@ interface StackEntry {
  * 2. ` 行内代码（内部 markdown 语法失效）
  * 3. ** 粗体
  * 4. * 斜体（注意与粗体的 ** 区分）
- * 5. > 引用块（按行处理）
+ * 5. > 引用块（按行处理，未换行则补 \n）
+ * 6. # / ## 标题 H1/H2（按行处理，未换行则补 \n）
+ * 7. 表格（缺分隔行则补分隔行，未换行则补 \n）
  */
 export function analyzeUnclosedMarks(text: string): StackEntry[] {
   const stack: StackEntry[] = []
@@ -141,6 +171,51 @@ export function analyzeUnclosedMarks(text: string): StackEntry[] {
   }
   if (boldOpen) {
     stack.push({ type: 'bold', closeTag: '**' })
+  }
+
+  // ===== 第四步：块级语法（引用、标题、表格）=====
+  // 仅检查“最后一行”是否未以换行结束，或表格是否缺分隔行
+  const safeLines = safeText.split('\n')
+  const endsWithNewline = safeText.length > 0 && safeText.endsWith('\n')
+  const lastLine = safeLines.length > 0 ? safeLines[safeLines.length - 1] : ''
+  const lastLineTrimmed = lastLine.trimStart()
+
+  // 5. 引用块：最后一行以 > 开头且未换行 → 补 \n
+  if (!endsWithNewline && lastLineTrimmed.startsWith('>')) {
+    stack.push({ type: 'blockquote', closeTag: '\n' })
+  }
+
+  // 6. 标题 H1/H2：最后一行以 # 或 ## 开头（# 后跟空格）且未换行 → 补 \n
+  const headingMatch = lastLineTrimmed.match(/^#{1,6}\s/)
+  if (!endsWithNewline && headingMatch) {
+    stack.push({ type: 'heading', closeTag: '\n' })
+  }
+
+  // 7. 表格：有表头行但无分隔行 → 补分隔行；最后一行是表格行且未换行 → 补 \n
+  let sawTableHeader = false
+  let sawTableSeparator = false
+  let firstTableHeaderRow = ''
+  for (let i = 0; i < safeLines.length; i++) {
+    const line = safeLines[i]
+    if (isTableSeparatorLine(line)) {
+      sawTableSeparator = true
+    } else if (isTableRowLine(line)) {
+      if (!sawTableHeader) {
+        sawTableHeader = true
+        firstTableHeaderRow = line
+      }
+    } else {
+      sawTableHeader = false
+      sawTableSeparator = false
+      firstTableHeaderRow = ''
+    }
+  }
+  // 先压入 \n，再压入分隔行，这样 LIFO 时先补分隔行再补 \n
+  if (!endsWithNewline && isTableRowLine(lastLine)) {
+    stack.push({ type: 'table', closeTag: '\n' })
+  }
+  if (sawTableHeader && !sawTableSeparator && firstTableHeaderRow) {
+    stack.push({ type: 'table', closeTag: makeTableSeparatorRow(firstTableHeaderRow) })
   }
 
   return stack

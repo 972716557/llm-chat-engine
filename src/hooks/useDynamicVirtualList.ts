@@ -27,8 +27,10 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
   const positionsRef = useRef<ItemPosition[]>([])
   const heightDiffQueueRef = useRef<HeightDiff[]>([])
   const ricHandleRef = useRef<number | null>(null)
+  const rafUrgentHandleRef = useRef<number | null>(null)
   const scrollContainerRef = useRef<HTMLDivElement>(null)
   const resizeObserverRef = useRef<ResizeObserver | null>(null)
+  const scheduleLayoutUpdateRef = useRef<() => void>(() => {})
 
   // scrollTop 用 ref 存储，避免每像素触发重渲染
   const scrollTopRef = useRef(0)
@@ -126,14 +128,11 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
     return positions[positions.length - 1].bottom
   }, [layoutVersion, totalCount]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ===== 调度 rIC 异步处理高度变更队列 =====
-  const scheduleLayoutUpdate = useCallback(() => {
-    if (ricHandleRef.current !== null) return
-
-    const callback = (deadline: IdleDeadline) => {
-      ricHandleRef.current = null
+  // ===== 执行布局更新（处理队列 + 级联 top/bottom + 滚动补偿）=====
+  // deadline 为 null 时不做时间分片，一次性跑完（用于流式尾部项，避免重叠）
+  const runLayoutUpdate = useCallback(
+    (deadline: IdleDeadline | null) => {
       const queue = heightDiffQueueRef.current
-
       if (queue.length === 0) return
 
       const diffs = queue.splice(0, queue.length)
@@ -156,22 +155,21 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
 
       if (minIndex === Infinity) return
 
-      // ===== 滚动补偿：记录视口锚点的旧位置 =====
       const currentScrollTop = scrollTopRef.current
-      // 找到当前视口顶部对应的条目，作为锚点
       const anchorIndex = findStartIndex(currentScrollTop)
       const oldAnchorTop = anchorIndex < positions.length ? positions[anchorIndex].top : 0
 
-      // 从 minIndex 开始级联更新
+      const timeRemaining = deadline ? () => deadline.timeRemaining() : () => Infinity
+
       let i = minIndex
       while (i < positions.length) {
-        if (deadline.timeRemaining() <= 0) {
+        if (timeRemaining() <= 0) {
           heightDiffQueueRef.current.push({
             index: i,
             newHeight: positions[i].height,
           })
-          scheduleLayoutUpdate()
-          break
+          scheduleLayoutUpdateRef.current()
+          return
         }
 
         positions[i].top = i === 0 ? 0 : positions[i - 1].bottom
@@ -179,7 +177,6 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
         i++
       }
 
-      // ===== 滚动补偿：如果锚点上方的高度变化了，调整 scrollTop =====
       const container = scrollContainerRef.current
       if (container && anchorIndex < positions.length && minIndex <= anchorIndex) {
         const newAnchorTop = positions[anchorIndex].top
@@ -190,9 +187,19 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
         }
       }
 
-      // 布局更新后重新计算可见范围
       updateVisibleRangeIfChanged(computeVisibleRange(scrollTopRef.current))
       setLayoutVersion((v) => v + 1)
+    },
+    [findStartIndex, computeVisibleRange, updateVisibleRangeIfChanged]
+  )
+
+  // ===== 调度 rIC 异步处理高度变更队列 =====
+  const scheduleLayoutUpdate = useCallback(() => {
+    if (ricHandleRef.current !== null) return
+
+    const callback = (deadline: IdleDeadline) => {
+      ricHandleRef.current = null
+      runLayoutUpdate(deadline)
     }
 
     if (typeof requestIdleCallback !== 'undefined') {
@@ -202,11 +209,18 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
         callback({ timeRemaining: () => 50, didTimeout: false } as IdleDeadline)
       }, 16) as unknown as number
     }
-  }, [computeVisibleRange, updateVisibleRangeIfChanged])
+  }, [runLayoutUpdate])
+
+  useEffect(() => {
+    scheduleLayoutUpdateRef.current = scheduleLayoutUpdate
+  }, [scheduleLayoutUpdate])
 
   // ===== 创建 ResizeObserver =====
   useEffect(() => {
     resizeObserverRef.current = new ResizeObserver((entries) => {
+      const positions = positionsRef.current
+      let lastIndexResized = -1
+
       for (const entry of entries) {
         const target = entry.target as HTMLElement
         const indexStr = target.dataset.index
@@ -215,16 +229,43 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
         const index = parseInt(indexStr, 10)
         const newHeight = entry.contentRect.height
 
-        const positions = positionsRef.current
         if (index < positions.length && Math.abs(positions[index].height - newHeight) > 0.5) {
           heightDiffQueueRef.current.push({ index, newHeight })
-          scheduleLayoutUpdate()
+          lastIndexResized = index
         }
+      }
+
+      if (heightDiffQueueRef.current.length === 0) return
+
+      // 流式消息通常是最后一项，高度频繁变化。若等 rIC 再更新会延迟数帧，导致该帧内
+      // positions/totalHeight 仍为旧值而 DOM 已变高，出现重叠。用 rAF 在下一帧前立即更新布局。
+      const isTailResize = positions.length > 0 && lastIndexResized === positions.length - 1
+      if (isTailResize) {
+        if (rafUrgentHandleRef.current !== null) {
+          cancelAnimationFrame(rafUrgentHandleRef.current)
+        }
+        if (ricHandleRef.current !== null) {
+          if (typeof cancelIdleCallback !== 'undefined') {
+            cancelIdleCallback(ricHandleRef.current)
+          } else {
+            clearTimeout(ricHandleRef.current)
+          }
+          ricHandleRef.current = null
+        }
+        rafUrgentHandleRef.current = requestAnimationFrame(() => {
+          rafUrgentHandleRef.current = null
+          runLayoutUpdate(null)
+        })
+      } else {
+        scheduleLayoutUpdate()
       }
     })
 
     return () => {
       resizeObserverRef.current?.disconnect()
+      if (rafUrgentHandleRef.current !== null) {
+        cancelAnimationFrame(rafUrgentHandleRef.current)
+      }
       if (ricHandleRef.current !== null) {
         if (typeof cancelIdleCallback !== 'undefined') {
           cancelIdleCallback(ricHandleRef.current)
@@ -233,7 +274,7 @@ export function useDynamicVirtualList(totalCount: number, containerHeight: numbe
         }
       }
     }
-  }, [scheduleLayoutUpdate])
+  }, [scheduleLayoutUpdate, runLayoutUpdate])
 
   // ===== 注册/取消 ResizeObserver 观察 =====
   const observeElement = useCallback((el: HTMLElement | null) => {
