@@ -280,14 +280,14 @@ export default function ChatContainer() {
     [historyMessages]
   )
 
-  // ===== 合并所有块：历史块 + 流式消息的块 =====
+  // ===== 合并所有块：历史块 + 流式消息的块（每条消息可能对应多块，虚拟列表按块区分高度）=====
   const allBlocks = useMemo(() => {
     if (!streamingMessage) return historyBlocks
     const streamBlocks = flattenToBlocks([streamingMessage])
     return [...historyBlocks, ...streamBlocks]
   }, [historyBlocks, streamingMessage])
 
-  // ===== 虚拟列表 Hook =====
+  // ===== 虚拟列表：条目 = 块，每个块独立高度；长消息已拆成多块，故按块虚拟滚动即可 =====
   const {
     scrollContainerRef,
     totalHeight,
